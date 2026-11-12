@@ -1,28 +1,30 @@
 import {RX_UUID,decodeSpecial,ACTUATORS} from './control-protocol.js';
 import {createControls} from './controls.js';
-import {DEFAULT_MAPPING,parseCSV,mapped,validMapping,LineDecoder} from './core.js';
+import {parseCSV,LineDecoder} from './core.js';
+import {decodePower,demoPower} from './power-protocol.js';
 const $=id=>document.getElementById(id);
 const SERVICE='6e400001-b5a3-f393-e0a9-e50e24dcca9e',TX='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
-let config=null;try{const saved=JSON.parse(localStorage.getItem('robot-monitor-mapping-v1'));if(validMapping(saved))config=saved;}catch{}
+const config={staleSeconds:1};
 let rxCharacteristic=null,lastStatus=null;
 let device,characteristic,connected=false,connecting=false,demo=false,demoTimer,sessionStart=0,lastReceived=0;
 let sequence=0,records=[],samples=[],limit=1000,windowSeconds=60,logsPaused=false,frozenLogs=null,search='',dirtyLogs=false,invalidLines=0,overflowLines=0;
-const controls=createControls({isConnected:()=>connected,isDemo:()=>demo,getRX:()=>rxCharacteristic,getStale:()=>config?.staleSeconds||3});
+const controls=createControls({isConnected:()=>connected,isDemo:()=>demo,getRX:()=>rxCharacteristic,getStale:()=>1,getPower:()=>lastStatus?{...lastStatus.power,t:lastStatus.t}:null});
 function selectTab(name){for(const key of ['status','control']){const selected=key===name;$(key+'Tab').setAttribute('aria-selected',String(selected));$(key+'Tab').tabIndex=selected?0:-1;$(key+'Panel').hidden=!selected;}if(name==='status'){renderLogs();drawCharts();}}
 for(const name of ['status','control']){$(name+'Tab').onclick=()=>selectTab(name);$(name+'Tab').onkeydown=e=>{if(['ArrowLeft','ArrowRight','Home','End'].includes(e.key)){e.preventDefault();const next=e.key==='Home'?'status':e.key==='End'?'control':name==='status'?'control':'status';selectTab(next);$(next+'Tab').focus();}};}
 const stream=new LineDecoder(receiveLine,()=>{overflowLines++;dirtyLogs=true;});
 const fmt=n=>n===null||n===undefined?'—':n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
 const time=t=>new Date(t).toLocaleTimeString('ja-JP',{hour12:false})+'.'+String(t%1000).padStart(3,'0');
-const labels={state:'現在のステート',error:'エラー',voltage:'電圧・現在値',voltageMin:'電圧・下限',voltageMax:'電圧・上限',current:'電流・現在値',currentMin:'電流・下限',currentMax:'電流・上限'};
-for(const [key,label] of Object.entries(labels)){
- const wrap=document.createElement('label');wrap.textContent=label;const input=document.createElement('input');input.id='map-'+key;input.type='number';input.min='1';input.max='256';input.step='1';input.placeholder='未使用';wrap.append(input);$('mappingFields').append(wrap);
+function receiveLine(raw){
+ const fields=parseCSV(raw),power=decodePower(raw),special=power||decodeSpecial(fields);
+ if(!fields||special?.kind==='invalid')invalidLines++;
+ const row={id:++sequence,t:Date.now(),raw,fields,power:power?.kind==='power'?power:null};
+ records.unshift(row);if(records.length>limit)records.length=limit;
+ if(row.power){lastStatus=row;samples.push(row);const cutoff=row.t-600000;while(samples.length&&(samples[0].t<cutoff||samples.length>6000))samples.shift();}
+ else if(special)controls.consume(special,row.t);
+ lastReceived=row.t;dirtyLogs=true;
 }
-function openSettings(){const c=config||DEFAULT_MAPPING;for(const key of Object.keys(labels))$('map-'+key).value=c[key]??'';for(const key of ['voltageScale','currentScale','staleSeconds'])$(key).value=c[key];$('sampleLine').textContent=lastStatus?.raw||'状態CSVは未受信';$('settingsError').textContent='';$('settings').showModal();}
-$('settingsButton').onclick=openSettings;$('configure').onclick=openSettings;$('closeSettings').onclick=()=>$('settings').close();
-$('settingsForm').onsubmit=e=>{e.preventDefault();const c={};for(const key of Object.keys(labels)){const v=$('map-'+key).value;c[key]=v===''?null:Number(v);}for(const key of ['voltageScale','currentScale','staleSeconds'])c[key]=Number($(key).value);if(!validMapping(c)){$('settingsError').textContent='列は1〜256、倍率は正の数を指定してください。';return;}config=c;if(!demo){try{localStorage.setItem('robot-monitor-mapping-v1',JSON.stringify(c));}catch{}}$('settings').close();$('mappingNotice').hidden=true;updateMetrics();drawCharts();};
-function receiveLine(raw){const fields=parseCSV(raw);const special=decodeSpecial(fields);if(!fields||special?.kind==='invalid')invalidLines++;const row={id:++sequence,t:Date.now(),raw,fields};records.unshift(row);if(records.length>limit)records.length=limit;if(special){controls.consume(special,row.t);}else if(fields){lastStatus=row;samples.push(row);const cutoff=row.t-600000;while(samples.length&&(samples[0].t<cutoff||samples.length>6000))samples.shift();}lastReceived=row.t;dirtyLogs=true;if($('settings').open)$('sampleLine').textContent=lastStatus?.raw||'状態CSVは未受信';}
-function enterDashboard(){connected=true;lastStatus=null;controls.reset();selectTab('status');sessionStart=Date.now();lastReceived=0;stream.reset();records=[];samples=[];sequence=invalidLines=overflowLines=0;logsPaused=false;frozenLogs=null;search='';$('logSearch').value='';$('pauseLogs').textContent='表示を一時停止';dirtyLogs=true;$('waiting').hidden=true;$('dashboard').hidden=false;$('demoBanner').hidden=!demo;$('deviceName').textContent=demo?'DEMO / SIMULATED DATA':device?.name||'ROBOTLOGS';$('mappingNotice').hidden=!!config;$('connectionError').textContent='';updateMetrics();renderLogs();drawCharts();}
-function disconnected(){connected=false;rxCharacteristic=null;controls.disconnect();stream.reset();characteristic?.removeEventListener('characteristicvaluechanged',onNotification);characteristic=null;if($('settings').open)$('settings').close();$('dashboard').hidden=true;$('waiting').hidden=false;$('connect').disabled=false;$('connect').querySelector('span').textContent='接続する';$('connectionError').textContent='接続が切れました。もう一度接続してください。';}
+function enterDashboard(){connected=true;lastStatus=null;controls.reset();selectTab('status');sessionStart=Date.now();lastReceived=0;stream.reset();records=[];samples=[];sequence=invalidLines=overflowLines=0;logsPaused=false;frozenLogs=null;search='';$('logSearch').value='';$('pauseLogs').textContent='表示を一時停止';dirtyLogs=true;$('waiting').hidden=true;$('dashboard').hidden=false;$('demoBanner').hidden=!demo;$('deviceName').textContent=demo?'DEMO / SIMULATED DATA':device?.name||'ROBOTLOGS';$('connectionError').textContent='';updateMetrics();renderLogs();drawCharts();}
+function disconnected(){connected=false;rxCharacteristic=null;controls.disconnect();stream.reset();characteristic?.removeEventListener('characteristicvaluechanged',onNotification);characteristic=null;$('dashboard').hidden=true;$('waiting').hidden=false;$('connect').disabled=false;$('connect').querySelector('span').textContent='接続する';$('connectionError').textContent='接続が切れました。もう一度接続してください。';}
 function onNotification(event){stream.push(event.target.value);}
 async function connect(){
  if(connecting)return;connecting=true;$('connect').disabled=true;$('connect').querySelector('span').textContent='接続中…';$('connectionError').textContent='';
@@ -40,18 +42,23 @@ async function connect(){
  finally{connecting=false;$('connect').disabled=false;$('connect').querySelector('span').textContent='接続する';}
 }
 $('connect').onclick=connect;$('disconnect').onclick=()=>{if(demo){stopDemo();return;}device?.gatt.disconnect();};
-function updateMetrics(){const latest=mapped(lastStatus?.fields,config);for(const k of ['state','error']){$(k+'Value').textContent=latest?.[k]??'—';$(k+'Value').title=latest?.[k]??'';}
- const age=lastReceived?(Date.now()-lastReceived)/1000:Infinity;const stale=age>(config?.staleSeconds||3);$('stateHint').textContent=!lastStatus?'状態CSV待ち':(Date.now()-lastStatus.t)>(config?.staleSeconds||3)*1000?'状態更新なし':'状態ログ受信中';$('stateDot').style.background=stale?'#c8b17d':'#2d9577';
- for(const k of ['voltage','current']){const value=latest?.[k]??null,low=latest?.[k+'Min']??null,high=latest?.[k+'Max']??null;$(k+'Value').textContent=value!==null?fmt(value):low!==null&&high!==null?`${fmt(low)}–${fmt(high)}`:'—';$(k+'Range').textContent=latest?.[k+'Invalid']?'下限 > 上限：列設定を確認':`下限 ${fmt(low)} / 上限 ${fmt(high)}`;}
- $('connectionBadge').classList.toggle('stale',stale);$('connectionBadge').replaceChildren();const i=document.createElement('i');$('connectionBadge').append(i,document.createTextNode(demo?'デモ':!lastReceived?'受信待ち':stale?'更新停止':'接続中'));
- $('updated').textContent=!lastReceived?'データ受信待ち':`${Math.floor(age)}秒前に受信`;const seconds=Math.floor((Date.now()-sessionStart)/1000);$('sessionTime').textContent=`${String(Math.floor(seconds/60)).padStart(2,'0')}:${String(seconds%60).padStart(2,'0')}`;
+function updateMetrics(){const latest=lastStatus?.power;for(const k of ['state','error']){$(k+'Value').textContent=latest?.[k]??'—';$(k+'Value').title=latest?.[k]??'';}
+ const age=lastStatus?(Date.now()-lastStatus.t)/1000:Infinity;const stale=age>(config?.staleSeconds||3);$('stateHint').textContent=!lastStatus?'電源基板の情報待ち':(Date.now()-lastStatus.t)>(config?.staleSeconds||3)*1000?'状態更新なし':'電源基板から受信中';$('stateDot').style.background=stale?'#c8b17d':'#2d9577';
+ for(const k of ['voltage','current']){const value=latest?.[k]??null,low=latest?.[k+'Min']??null,high=latest?.[k+'Max']??null;$(k+'Value').textContent=value!==null?fmt(value):low!==null&&high!==null?`${fmt(low)}–${fmt(high)}`:'—';$(k+'Range').textContent=latest?.[k+'Invalid']?'範囲が不正です':`100ms最小 ${fmt(low)} / 最大 ${fmt(high)}`;}
+ for(const [id,key] of [['mainRelay','main'],['preRelay','pre'],['regenRelay','regen'],['estopInput','estop']]){
+   const e=$(id);e.textContent=!latest?'未受信':stale?'更新停止':key==='estop'?(latest[key]?'作動中':!latest.main||latest.stateCode===1?'判定待ち / 対象外':'正常'):key==='regen'?(latest[key]?'ON · 抵抗遮断':'OFF · 抵抗導通'):(latest[key]?'ON':'OFF');e.classList.toggle('active',!!latest?.[key]&&!stale);
+ }
+ $('powerAge').textContent=!latest?'CH32からの受信待ち':stale?'電源情報が更新されていません':`基板稼働 ${Math.floor(latest.uptime/1000)}秒 · ADC ${latest.valid?'有効':latest.stateCode===3?'安定待ち':'無効'}`;
+ $('errorHint').textContent=stale?'表示は最終受信時の値':latest?.errorCode?'保護停止は再投入操作まで保持':'保護異常なし';
+ $('connectionBadge').classList.toggle('stale',stale);$('connectionBadge').replaceChildren();const i=document.createElement('i');$('connectionBadge').append(i,document.createTextNode(demo?'デモ':!lastStatus?'電源情報待ち':stale?'更新停止':'接続中'));
+ $('updated').textContent=!lastStatus?'電源情報待ち':`${Math.floor(age)}秒前に受信`;const seconds=Math.floor((Date.now()-sessionStart)/1000);$('sessionTime').textContent=`${String(Math.floor(seconds/60)).padStart(2,'0')}:${String(seconds%60).padStart(2,'0')}`;
 }
 function drawCharts(){if(!connected||$('statusPanel').hidden)return;for(const kind of ['voltage','current'])drawChart(kind);}
 function drawChart(kind){
  const canvas=$(kind+'Chart'),rect=canvas.getBoundingClientRect();if(!rect.width)return;
  const ratio=window.devicePixelRatio||1;canvas.width=Math.round(rect.width*ratio);canvas.height=Math.round(rect.height*ratio);const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);
  const w=rect.width,h=rect.height,L=49,R=12,T=12,B=29,pw=w-L-R,ph=h-T-B,end=Date.now(),start=end-windowSeconds*1000;
- const points=samples.filter(r=>r.t>=start).map(r=>({t:r.t,...mapped(r.fields,config)}));
+ const points=samples.filter(r=>r.t>=start).map(r=>({t:r.t,...r.power}));
  const keys=[kind+'Min',kind+'Max',kind],values=points.flatMap(p=>keys.map(k=>p[k]).filter(v=>typeof v==='number'&&Number.isFinite(v)));
  let min=0,max=1;if(values.length){min=Math.min(...values);max=Math.max(...values);const pad=Math.max((max-min)*.18,.1,Math.abs(max)*.015);min-=pad;max+=pad;}
  const x=t=>L+(t-start)/(end-start)*pw,y=v=>T+(max-v)/(max-min)*ph;
@@ -63,7 +70,7 @@ function drawChart(kind){
  function segments(required){const groups=[];let group=[];for(const p of points){if(required.some(k=>p[k]===null||p[k]===undefined)){if(group.length)groups.push(group);group=[];continue;}if(group.length&&p.t-group.at(-1).t>(config?.staleSeconds||3)*1000){groups.push(group);group=[];}group.push(p);}if(group.length)groups.push(group);return groups;}
  for(const group of segments([kind+'Min',kind+'Max'])){ctx.beginPath();group.forEach((p,i)=>i?ctx.lineTo(x(p.t),y(p[kind+'Max'])):ctx.moveTo(x(p.t),y(p[kind+'Max'])));[...group].reverse().forEach(p=>ctx.lineTo(x(p.t),y(p[kind+'Min'])));ctx.closePath();ctx.fillStyle=fill;ctx.fill();}
  for(const key of keys){ctx.setLineDash(key===kind?[3,4]:[]);ctx.strokeStyle=color;ctx.lineWidth=key===kind?1.3:1.7;for(const group of segments([key])){ctx.beginPath();group.forEach((p,i)=>i?ctx.lineTo(x(p.t),y(p[key])):ctx.moveTo(x(p.t),y(p[key])));ctx.stroke();if(group.length===1){ctx.beginPath();ctx.arc(x(group[0].t),y(group[0][key]),2,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();}}}
- ctx.restore();$(kind+'Empty').hidden=values.length>0;$(kind+'Empty').textContent=!config?'CSVの列を設定してください':!lastReceived?'データを待っています':'表示できる数値がありません';
+ ctx.restore();$(kind+'Empty').hidden=values.length>0;$(kind+'Empty').textContent=!lastStatus?'電源基板の情報を待っています':'ADC値が無効です';
 }
 function renderLogs(){
  const viewport=$('logViewport'),atTop=viewport.scrollTop<5,oldTop=viewport.scrollTop;const firstVisible=[...$('logBody').children].find(row=>row.offsetTop+row.offsetHeight>oldTop+32);const anchor=firstVisible?{id:firstVisible.dataset.id,offset:firstVisible.offsetTop-oldTop}:null;
@@ -82,8 +89,10 @@ let lastDraw=0;setInterval(()=>{if(!connected)return;controls.tick();updateMetri
 for(const element of [$('logSearch'),$('logLimit')])element.addEventListener('change',renderLogs);
 $('logSearch').addEventListener('input',()=>{if(logsPaused)renderLogs();});
 new ResizeObserver(drawCharts).observe($('dashboard'));
-function stopDemo(){clearInterval(demoTimer);demo=false;config=null;try{const saved=JSON.parse(localStorage.getItem('robot-monitor-mapping-v1'));if(validMapping(saved))config=saved;}catch{}const u=new URL(location.href);u.searchParams.delete('demo');history.replaceState(null,'',u);disconnected();$('connectionError').textContent='';}
+function stopDemo(){clearInterval(demoTimer);demo=false;const u=new URL(location.href);u.searchParams.delete('demo');history.replaceState(null,'',u);disconnected();$('connectionError').textContent='';}
 $('exitDemo').onclick=stopDemo;
 if(new URLSearchParams(location.search).get('demo')==='1'){
- demo=true;config={...DEFAULT_MAPPING,current:8,voltageMin:9,voltageMax:10};enterDashboard();const now=Date.now();for(let i=0;i<180;i++){const t=now-(179-i)*400;const wave=Math.sin(i*.13),current=1.8+wave*.6,voltage=24.6+Math.sin(i*.1)*.12;receiveLine(`RUN,NONE,${(current-.3).toFixed(2)},${(current+.35).toFixed(2)},${voltage.toFixed(2)},1,0,${current.toFixed(2)},${(voltage-.09).toFixed(2)},${(voltage+.1).toFixed(2)}`);samples.at(-1).t=t;}lastReceived=now;let i=180;demoTimer=setInterval(()=>{const current=1.8+Math.sin(i*.13)*.6,voltage=24.6+Math.sin(i*.1)*.12;i++;receiveLine(`RUN,NONE,${(current-.3).toFixed(2)},${(current+.35).toFixed(2)},${voltage.toFixed(2)},1,0,${current.toFixed(2)},${(voltage-.09).toFixed(2)},${(voltage+.1).toFixed(2)}`);if(i%5===0)for(const a of ACTUATORS)receiveLine(`ACT,${a.id},IDLE,${a.type==='BLDC'?'':(20+a.id).toFixed(2)},0,0.10,${a.type==='QDD'?'0.00':''},NONE`);},400);
+ demo=true;enterDashboard();const now=Date.now();
+ for(let i=0;i<180;i++){receiveLine(demoPower(i));samples.at(-1).t=now-(179-i)*100;}
+ let i=180;demoTimer=setInterval(()=>receiveLine(demoPower(i++)),100);
 }

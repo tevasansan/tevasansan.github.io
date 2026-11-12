@@ -1,7 +1,8 @@
-import {ACTUATORS,MODES,encodeCommand,describeCommand} from './control-protocol.js';
+import {ACTUATORS,MODES,OPS,encodeCommand,describeCommand} from './control-protocol.js';
+import {RESULTS} from './power-protocol.js';
 const $=id=>document.getElementById(id);
-export function createControls({isConnected,isDemo,getRX,getStale}){
- let sending=false,epoch=0,seq=Math.floor(Date.now()%3000000000),history=[],states=new Map();
+export function createControls({isConnected,isDemo,getRX,getStale,getPower}){
+ let sending=false,epoch=0,seq=Math.floor(Date.now()%3000000000),history=[],states=new Map(),can=null;
  const pending=new Map(),rows=new Map();
  const number=v=>v===null||v===undefined?'—':v.toLocaleString('en-US',{maximumFractionDigits:2});
  const allButtons=[];
@@ -20,15 +21,22 @@ export function createControls({isConnected,isDemo,getRX,getStale}){
   send.onclick=()=>{if(!input.disabled&&(input.value===''||!input.checkValidity())){input.reportValidity();showLocalError(`${actuator.name}: 目標値を入力してください`);return;}sendCommand(select.value,actuator.id,input.disabled?0:Number(input.value));};
   stop.onclick=()=>sendCommand('STOP',actuator.id,0);group.append(select,input,unit,send,stop);control.append(group);tr.append(control);$('actuatorBody').append(tr);rows.set(actuator.id,{state,age,values});allButtons.push(send,stop);
  }
- for(const [id,op] of [['calibrate','CALIBRATE'],['emergencyStop','ESTOP'],['powerOff','POWER_OFF']]){$(id).onclick=()=>sendCommand(op,0,0);allButtons.push($(id));}
+ for(const [id,op] of [['calibrate','CALIBRATE'],['emergencyStop','ESTOP'],['powerOff','POWER_OFF'],['powerRestart','POWER_RESTART']]){$(id).onclick=()=>sendCommand(op,0,0);allButtons.push($(id));}
  function showLocalError(message){$('controlAvailability').textContent=message;}
  function renderHistory(){const f=document.createDocumentFragment();for(const h of history){const li=document.createElement('li');const t=document.createElement('time');t.textContent=new Date(h.t).toLocaleTimeString('ja-JP',{hour12:false});const code=document.createElement('code');code.textContent=h.text;const result=document.createElement('span');result.className='result'+(h.failed?' failed':'');result.textContent=h.result;li.append(t,code,result);f.append(li);}$('commandHistory').replaceChildren(f);$('noCommands').hidden=history.length>0;}
- function enableControls(){const available=isConnected()&&(isDemo()||!!getRX());for(const b of allButtons)b.disabled=!available||sending;}
+ function enableControls(){
+  const available=isConnected()&&(isDemo()||!!getRX()),power=getPower(),fresh=power&&Date.now()-power.t<1000;
+  for(const b of allButtons){const implemented=['calibrate','emergencyStop','powerOff','powerRestart'].includes(b.id);b.disabled=!available||sending||!implemented;
+    if(b.id==='calibrate')b.disabled=b.disabled||!fresh||!power.valid||power.stateCode!==2||power.errorCode!==0||!can?.alive||Date.now()-can.t>=1000||!!(can.errors&0x4f)||!!(can.flags&2)||[...pending.values()].some(r=>r.op==='CALIBRATE');
+    if(b.id==='powerRestart')b.disabled=b.disabled||!fresh||!power.valid||power.estop||[...pending.values()].some(r=>r.op==='POWER_RESTART');
+  }
+ }
  async function sendCommand(op,target,value){
   if(sending||!isConnected()||(!isDemo()&&!getRX()))return;
+  if(op==='POWER_RESTART'&&!isDemo()&&!window.confirm('モーター電源を一度遮断し、プリチャージから再投入します。操作入力を中立にして実行してください。'))return;
   const commandSeq=++seq;if(seq>=0xffffffff)seq=0;
   let data;try{data=encodeCommand(commandSeq,op,target,value);}catch(e){showLocalError(e.message);return;}
-  const row={seq:commandSeq,t:Date.now(),text:describeCommand(commandSeq,op,target,value),result:'BLE送信中…'};history.unshift(row);history=history.slice(0,50);pending.set(commandSeq,row);renderHistory();sending=true;enableControls();const currentEpoch=epoch;
+  const row={op,seq:commandSeq,t:Date.now(),text:describeCommand(commandSeq,op,target,value),result:'BLE送信中…'};history.unshift(row);history=history.slice(0,50);pending.set(commandSeq,row);renderHistory();sending=true;enableControls();const currentEpoch=epoch;
   try{
    if(isDemo()){
     row.result='デモ：指令生成のみ（未送信）';pending.delete(commandSeq);
@@ -37,21 +45,41 @@ export function createControls({isConnected,isDemo,getRX,getStale}){
     // Never retry robot commands automatically.
     await getRX().writeValueWithResponse(data);
     if(epoch!==currentEpoch)return;
-    if(pending.has(commandSeq))row.result='BLE受信済み · UART転送待ち';
+    if(pending.has(commandSeq))row.result='BLE受信済み · 基板の応答待ち';
    }
   }catch(error){if(epoch!==currentEpoch)return;pending.delete(commandSeq);row.result='送信結果不明：'+error.message;row.failed=true;}
   finally{if(epoch===currentEpoch){sending=false;enableControls();renderHistory();}}
  }
  function consume(message,t){
-  if(message.kind==='actuator'){states.set(message.id,{...message,t});}
-  else if(message.kind==='ack'){const row=pending.get(message.seq);if(row){row.result='UART転送済み（動作未実装）';pending.delete(message.seq);renderHistory();}}
+  if(message.kind==='can'){can={...message,t};}
+  else if(message.kind==='canAck'){
+   const row=pending.get(message.seq);if(!row||row.op!=='CALIBRATE')return;
+   row.result=({1:'QDD基板が受理',2:'キャリブレーション実行中',3:'キャリブレーション完了',4:'指令拒否',5:'キャリブレーション失敗',6:'キャリブレーション中止'})[message.result]+(message.errors?` / エラー 0x${message.errors.toString(16)}`:'');
+   row.failed=message.result>=4;
+   if(message.result>=3)pending.delete(message.seq);
+   renderHistory();
+  }
+  else if(message.kind==='actuator'){states.set(message.id,{...message,t});}
+  else if(message.kind==='ack'){const row=pending.get(message.seq);if(row){row.result='UART転送済み · 電源基板の応答待ち';renderHistory();}}
+  else if(message.kind==='powerAck'){
+   const row=pending.get(message.seq);if(!row||OPS[row.op]!==message.op)return;
+   row.result=message.result===1?(row.op==='POWER_RESTART'?'電源再投入完了':row.op==='ESTOP'?'停止ラッチ設定済み':'主・プリチャージ出力OFF'):RESULTS[message.result];
+   row.failed=message.result>=3;
+   if(message.result!==2)pending.delete(message.seq);
+   renderHistory();
+  }
  }
  function tick(){
   const now=Date.now();let count=0;for(const [id,row] of rows){const s=states.get(id);if(!s){row.state.textContent='未受信';row.age.textContent='—';row.age.classList.remove('stale');for(const td of Object.values(row.values))td.textContent='—';continue;}count++;const stale=now-s.t>getStale()*1000;row.state.textContent=s.state||'—';row.state.title=s.state;row.age.textContent=stale?`更新停止 · ${Math.floor((now-s.t)/1000)}秒前`:`${Math.floor((now-s.t)/1000)}秒前`;row.age.classList.toggle('stale',stale);for(const [key,td] of Object.entries(row.values)){td.textContent=key==='error'?(s.error||'—'):number(s[key]);td.title=td.textContent;}}
+  const canFresh=can&&now-can.t<1000;
+  $('canState').textContent=!canFresh?'更新なし':can.alive?'接続中':'通信断';
+  $('canErrors').textContent=!canFresh||!can.alive?'—':`0x${can.errors.toString(16).padStart(4,'0')}`;
+  $('canLimits').textContent=!canFresh||!can.alive||can.limits<0?'—':Array.from({length:4},(_,i)=>`${i+1}: ${can.limits&(1<<i)?'ON':'OFF'}`).join(' / ');
+  $('canHome').textContent=!canFresh||!can.alive||can.done<0?'—':`${can.flags&2?'実行中':can.flags&4?'完了':'待機'} / 完了軸 ${[0,1,2,3].filter(i=>can.done&(1<<i)).map(i=>i+1).join(',')||'なし'}`;
   $('actuatorSummary').textContent=`${count} / ${ACTUATORS.length} 受信`;
-  let changed=false;for(const [id,row] of pending){if(now-row.t>5000){row.result='UART転送確認なし（結果不明・再送なし）';row.failed=true;pending.delete(id);changed=true;}}if(changed)renderHistory();enableControls();
+  let changed=false;for(const [id,row] of pending){if(now-row.t>(row.op==='CALIBRATE'?95000:10000)){row.result='基板の完了応答なし（結果不明・再送なし）';row.failed=true;pending.delete(id);changed=true;}}if(changed)renderHistory();enableControls();
  }
- function reset(){epoch++;pending.clear();states.clear();history=[];sending=false;renderHistory();$('controlAvailability').textContent=isDemo()?'デモ：ボタンは指令生成のみ。実機への送信は行いません。':getRX()?'指令送信可能 · ACKでUARTへの転送を確認します。':'受信専用のファームウェアです。操作するにはArduino側を更新してください。';tick();}
+ function reset(){epoch++;pending.clear();states.clear();can=null;history=[];sending=false;renderHistory();$('controlAvailability').textContent=isDemo()?'デモ：ボタンは指令生成のみ。実機への送信は行いません。':getRX()?'電源操作とQDD基板のキャリブレーションに対応。個別モーター操作は未実装です。':'受信専用のファームウェアです。操作するにはArduino側を更新してください。';tick();}
  function disconnect(){epoch++;sending=false;for(const row of pending.values()){row.result='切断：転送結果不明（再送なし）';row.failed=true;}pending.clear();enableControls();renderHistory();}
  return {consume,tick,reset,disconnect};
 }
