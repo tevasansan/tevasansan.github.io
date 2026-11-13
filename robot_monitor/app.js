@@ -1,7 +1,7 @@
-import {RX_UUID,decodeSpecial,ACTUATORS} from './control-protocol.js';
-import {createControls} from './controls.js';
-import {parseCSV,LineDecoder} from './core.js';
-import {decodePower,demoPower} from './power-protocol.js';
+import {RX_UUID,decodeSpecial,ACTUATORS} from './control-protocol.js?v=20261113-cal2';
+import {createControls} from './controls.js?v=20261113-cal2';
+import {parseCSV,LineDecoder} from './core.js?v=20261113-cal2';
+import {decodePower,demoPower} from './power-protocol.js?v=20261113-cal2';
 const $=id=>document.getElementById(id);
 const SERVICE='6e400001-b5a3-f393-e0a9-e50e24dcca9e',TX='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 const config={staleSeconds:1};

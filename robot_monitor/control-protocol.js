@@ -1,4 +1,4 @@
-import {numeric} from './core.js';
+import {numeric} from './core.js?v=20261113-cal2';
 export const RX_UUID='6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 export const ACTUATORS=[
  ...Array.from({length:5},(_,i)=>({id:i+1,name:`BLDC ${i+1}`,model:'CHP-42GP-BL4260',type:'BLDC'})),
@@ -17,10 +17,16 @@ export function encodeCommand(seq,op,target=0,value=0){
 export function decodeSpecial(fields){
  if(!fields)return null;
  if(fields[0]==='CAN'){
-  if(fields.length!==8||fields.slice(1).some(s=>!/^(-?\d+)$/.test(s)))return {kind:'invalid'};
-  const [base,alive,errors,flags,stage,limits,done]=fields.slice(1).map(Number);
-  if(base!==0x720||![0,1].includes(alive)||errors<0||errors>65535||flags<0||flags>7||stage< -1||stage>5||limits< -1||limits>15||done< -1||done>15)return {kind:'invalid'};
-  return {kind:'can',base,alive:!!alive,errors,flags,stage,limits,done};
+  if(![8,10].includes(fields.length)||fields.slice(1).some(s=>!/^(-?\d+)$/.test(s)))return {kind:'invalid'};
+  const [base,alive,errors,flags,stage,limits,done,axis=-1,phase=-1]=fields.slice(1).map(Number);
+  if(base!==0x720||![0,1].includes(alive)||errors<0||errors>65535||flags<0||flags>7||stage< -1||stage>5||limits< -1||limits>15||done< -1||done>15||axis< -1||axis>4||phase< -1||phase>5)return {kind:'invalid'};
+  return {kind:'can',base,alive:!!alive,errors,flags,stage,limits,done,axis,phase};
+ }
+ if(fields[0]==='CAL'){
+  if(fields.length!==5||fields.slice(1).some(s=>!/^\d+$/.test(s)))return {kind:'invalid'};
+  const [stage,axis,phase,done]=fields.slice(1).map(Number);
+  if(stage>5||axis>4||phase>5||done>15)return {kind:'invalid'};
+  return {kind:'calibration',stage,axis,phase,done};
  }
  if(fields[0]==='C_ACK'){
   if(fields.length!==4||fields.slice(1).some(s=>!/^\d+$/.test(s)))return {kind:'invalid'};

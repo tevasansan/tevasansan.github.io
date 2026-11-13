@@ -1,8 +1,9 @@
-import {ACTUATORS,MODES,OPS,encodeCommand,describeCommand} from './control-protocol.js';
-import {RESULTS} from './power-protocol.js';
+import {ACTUATORS,MODES,OPS,encodeCommand,describeCommand} from './control-protocol.js?v=20261113-cal2';
+import {RESULTS} from './power-protocol.js?v=20261113-cal2';
+import {describeCanErrors,calibrationBlockReason,calibrationProgress} from './calibration.js?v=20261113-cal2';
 const $=id=>document.getElementById(id);
 export function createControls({isConnected,isDemo,getRX,getStale,getPower}){
- let sending=false,epoch=0,seq=Math.floor(Date.now()%3000000000),history=[],states=new Map(),can=null;
+ let sending=false,epoch=0,seq=Math.floor(Date.now()%3000000000),history=[],states=new Map(),can=null,progress=null;
  const pending=new Map(),rows=new Map();
  const number=v=>v===null||v===undefined?'—':v.toLocaleString('en-US',{maximumFractionDigits:2});
  const allButtons=[];
@@ -26,8 +27,12 @@ export function createControls({isConnected,isDemo,getRX,getStale,getPower}){
  function renderHistory(){const f=document.createDocumentFragment();for(const h of history){const li=document.createElement('li');const t=document.createElement('time');t.textContent=new Date(h.t).toLocaleTimeString('ja-JP',{hour12:false});const code=document.createElement('code');code.textContent=h.text;const result=document.createElement('span');result.className='result'+(h.failed?' failed':'');result.textContent=h.result;li.append(t,code,result);f.append(li);}$('commandHistory').replaceChildren(f);$('noCommands').hidden=history.length>0;}
  function enableControls(){
   const available=isConnected()&&(isDemo()||!!getRX()),power=getPower(),fresh=power&&Date.now()-power.t<1000;
+  const reason=calibrationBlockReason({available,power,can,now:Date.now(),pending:[...pending.values()].some(r=>r.op==='CALIBRATE')});
+  const availability=$('calibrationAvailability');
+  if(availability)availability.textContent=reason||'開始できます：QDD 1 → QDD 2 → QDD 3 → DCモーター';
+  $('calibrate').title=reason||'4軸の原点出しを開始';
   for(const b of allButtons){const implemented=['calibrate','emergencyStop','powerOff','powerRestart'].includes(b.id);b.disabled=!available||sending||!implemented;
-    if(b.id==='calibrate')b.disabled=b.disabled||!fresh||!power.valid||power.stateCode!==2||power.errorCode!==0||!can?.alive||Date.now()-can.t>=1000||!!(can.errors&0x4f)||!!(can.flags&2)||[...pending.values()].some(r=>r.op==='CALIBRATE');
+    if(b.id==='calibrate')b.disabled=b.disabled||!!reason;
     if(b.id==='powerRestart')b.disabled=b.disabled||!fresh||!power.valid||power.estop||[...pending.values()].some(r=>r.op==='POWER_RESTART');
   }
  }
@@ -52,9 +57,10 @@ export function createControls({isConnected,isDemo,getRX,getStale,getPower}){
  }
  function consume(message,t){
   if(message.kind==='can'){can={...message,t};}
+  else if(message.kind==='calibration'){progress={...message,t};}
   else if(message.kind==='canAck'){
    const row=pending.get(message.seq);if(!row||row.op!=='CALIBRATE')return;
-   row.result=({1:'QDD基板が受理',2:'キャリブレーション実行中',3:'キャリブレーション完了',4:'指令拒否',5:'キャリブレーション失敗',6:'キャリブレーション中止'})[message.result]+(message.errors?` / エラー 0x${message.errors.toString(16)}`:'');
+   row.result=({1:'QDD基板が受理',2:'キャリブレーション実行中',3:'キャリブレーション完了',4:'指令拒否',5:'キャリブレーション失敗',6:'キャリブレーション中止'})[message.result]+(message.errors?` / 0x${message.errors.toString(16)}：${describeCanErrors(message.errors)}`:message.result===4?'：既に実行中':'');
    row.failed=message.result>=4;
    if(message.result>=3)pending.delete(message.seq);
    renderHistory();
@@ -73,13 +79,14 @@ export function createControls({isConnected,isDemo,getRX,getStale,getPower}){
   const now=Date.now();let count=0;for(const [id,row] of rows){const s=states.get(id);if(!s){row.state.textContent='未受信';row.age.textContent='—';row.age.classList.remove('stale');for(const td of Object.values(row.values))td.textContent='—';continue;}count++;const stale=now-s.t>getStale()*1000;row.state.textContent=s.state||'—';row.state.title=s.state;row.age.textContent=stale?`更新停止 · ${Math.floor((now-s.t)/1000)}秒前`:`${Math.floor((now-s.t)/1000)}秒前`;row.age.classList.toggle('stale',stale);for(const [key,td] of Object.entries(row.values)){td.textContent=key==='error'?(s.error||'—'):number(s[key]);td.title=td.textContent;}}
   const canFresh=can&&now-can.t<1000;
   $('canState').textContent=!canFresh?'更新なし':can.alive?'接続中':'通信断';
-  $('canErrors').textContent=!canFresh||!can.alive?'—':`0x${can.errors.toString(16).padStart(4,'0')}`;
+  $('canErrors').textContent=!canFresh||!can.alive?'—':`0x${can.errors.toString(16).padStart(4,'0')}：${describeCanErrors(can.errors)}`;
   $('canLimits').textContent=!canFresh||!can.alive||can.limits<0?'—':Array.from({length:4},(_,i)=>`${i+1}: ${can.limits&(1<<i)?'ON':'OFF'}`).join(' / ');
-  $('canHome').textContent=!canFresh||!can.alive||can.done<0?'—':`${can.flags&2?'実行中':can.flags&4?'完了':'待機'} / 完了軸 ${[0,1,2,3].filter(i=>can.done&(1<<i)).map(i=>i+1).join(',')||'なし'}`;
+  const home=progress&&now-progress.t<1000&&progress.stage===can?.stage?{...can,...progress}:can;
+  $('canHome').textContent=!canFresh||!can.alive||can.done<0?'—':`${calibrationProgress(home)} / 完了軸 ${[0,1,2,3].filter(i=>can.done&(1<<i)).map(i=>i<3?`QDD ${i+1}`:'DC').join(', ')||'なし'}`;
   $('actuatorSummary').textContent=`${count} / ${ACTUATORS.length} 受信`;
   let changed=false;for(const [id,row] of pending){if(now-row.t>(row.op==='CALIBRATE'?95000:10000)){row.result='基板の完了応答なし（結果不明・再送なし）';row.failed=true;pending.delete(id);changed=true;}}if(changed)renderHistory();enableControls();
  }
- function reset(){epoch++;pending.clear();states.clear();can=null;history=[];sending=false;renderHistory();$('controlAvailability').textContent=isDemo()?'デモ：ボタンは指令生成のみ。実機への送信は行いません。':getRX()?'電源操作とQDD基板のキャリブレーションに対応。個別モーター操作は未実装です。':'受信専用のファームウェアです。操作するにはArduino側を更新してください。';tick();}
+ function reset(){epoch++;pending.clear();states.clear();can=null;progress=null;history=[];sending=false;renderHistory();$('controlAvailability').textContent=isDemo()?'デモ：ボタンは指令生成のみ。実機への送信は行いません。':getRX()?'電源操作とQDD基板のキャリブレーションに対応。個別モーター操作は未実装です。':'受信専用のファームウェアです。操作するにはArduino側を更新してください。';tick();}
  function disconnect(){epoch++;sending=false;for(const row of pending.values()){row.result='切断：転送結果不明（再送なし）';row.failed=true;}pending.clear();enableControls();renderHistory();}
  return {consume,tick,reset,disconnect};
 }
